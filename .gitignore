@@ -1,0 +1,12 @@
+service_account_key.json
+gspread_authorized_user.json
+gspread_credentials.json
+client_secret*.json
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+_recovery_pending_attachment.xlsx
+*.log

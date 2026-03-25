@@ -1,0 +1,79 @@
+# Flipkart ODH Debit Master — copy source, analyze, push to Google Sheets.
+# Schedule: approximately every 48 hours (daily cron + alternating Unix-day gate).
+# Manual: Actions → Run workflow
+
+name: Flipkart Debit Master Sync
+
+on:
+  schedule:
+    # Once per UTC day; combined with gate below → effective interval ~48h for scheduled runs
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 48-hour gate (scheduled runs only)
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=yes" >> $GITHUB_OUTPUT
+            echo "reason=workflow_dispatch" >> $GITHUB_OUTPUT
+          else
+            DAY=$(($(date +%s) / 86400))
+            # Alternate days → ~48h between consecutive successful scheduled runs
+            if [ $((DAY % 2)) -eq 1 ]; then
+              echo "run=yes" >> $GITHUB_OUTPUT
+              echo "reason=48h_cycle_day_$DAY" >> $GITHUB_OUTPUT
+            else
+              echo "run=no" >> $GITHUB_OUTPUT
+              echo "reason=skip_off_cycle_day_$DAY" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Skip (between 48h windows)
+        if: steps.gate.outputs.run != 'yes'
+        run: |
+          echo "Skipping scheduled run: ${{ steps.gate.outputs.reason }}"
+          exit 0
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'yes'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'yes'
+        run: pip install -r requirements.txt
+
+      - name: Write service account key
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$SA_JSON" ]; then
+            echo "::error::Set repository secret GOOGLE_SERVICE_ACCOUNT_JSON (full service account JSON)."
+            exit 1
+          fi
+          python -c "import os, pathlib; pathlib.Path('service_account_key.json').write_text(os.environ['SA_JSON'], encoding='utf-8')"
+
+      - name: Run Flipkart Debit Master sync
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          FLIPKART_ODH_SPREADSHEET_ID: ${{ secrets.FLIPKART_ODH_SPREADSHEET_ID }}
+          # Optional WhatsApp (remove --no-whatsapp below if you configure these)
+          WHAPI_TOKEN: ${{ secrets.WHAPI_TOKEN }}
+          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
+          HTML_TO_IMAGE_SERVICE_URL: ${{ secrets.HTML_TO_IMAGE_SERVICE_URL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_SENDER_EMAIL: ${{ secrets.GMAIL_SENDER_EMAIL }}
+        run: |
+          python flipkart_debit_master_sync.py --no-email --no-whatsapp
