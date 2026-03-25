@@ -1,12 +1,13 @@
-# Flipkart ODH Debit Master — copy source, analyze, push to Google Sheets.
-# Schedule: approximately every 48 hours (daily cron + alternating Unix-day gate).
-# Manual: Actions → Run workflow
+# Flipkart ODH Debit Master — same CI pattern as Meesho_DebitMaster_Automation:
+#   - SERVICE_ACCOUNT_JSON (or GOOGLE_SERVICE_ACCOUNT_JSON) → service_account_key.json
+#   - Optional GSPREAD_CREDENTIALS_JSON + GSPREAD_AUTHORIZED_USER_JSON → OAuth copy when source not shared with SA
+#   - Chrome for WhatsApp sheet images
+# Schedule: ~48h via daily cron + alternating Unix-day gate. Manual: Actions → Run workflow
 
 name: Flipkart Debit Master Sync
 
 on:
   schedule:
-    # Once per UTC day; combined with gate below → effective interval ~48h for scheduled runs
     - cron: "0 7 * * *"
   workflow_dispatch:
 
@@ -27,7 +28,6 @@ jobs:
             echo "reason=workflow_dispatch" >> $GITHUB_OUTPUT
           else
             DAY=$(($(date +%s) / 86400))
-            # Alternate days → ~48h between consecutive successful scheduled runs
             if [ $((DAY % 2)) -eq 1 ]; then
               echo "run=yes" >> $GITHUB_OUTPUT
               echo "reason=48h_cycle_day_$DAY" >> $GITHUB_OUTPUT
@@ -52,28 +52,72 @@ jobs:
 
       - name: Install dependencies
         if: steps.gate.outputs.run == 'yes'
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Write service account key
+      - name: Setup Chrome for WhatsApp image conversion
+        if: steps.gate.outputs.run == 'yes'
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          install-chromedriver: true
+          install-dependencies: true
+
+      - name: Create service account key file
         if: steps.gate.outputs.run == 'yes'
         env:
-          SA_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          if [ -z "$SA_JSON" ]; then
-            echo "::error::Set repository secret GOOGLE_SERVICE_ACCOUNT_JSON (full service account JSON)."
+          if [ -n "$SERVICE_ACCOUNT_JSON" ]; then
+            python -c "import os, pathlib; pathlib.Path('service_account_key.json').write_text(os.environ['SERVICE_ACCOUNT_JSON'], encoding='utf-8')"
+            echo "Service account key created (SERVICE_ACCOUNT_JSON)"
+          elif [ -n "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
+            python -c "import os, pathlib; pathlib.Path('service_account_key.json').write_text(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'], encoding='utf-8')"
+            echo "Service account key created (GOOGLE_SERVICE_ACCOUNT_JSON)"
+          else
+            echo "::error::Set repository secret SERVICE_ACCOUNT_JSON (same as Meesho) or GOOGLE_SERVICE_ACCOUNT_JSON."
             exit 1
           fi
-          python -c "import os, pathlib; pathlib.Path('service_account_key.json').write_text(os.environ['SA_JSON'], encoding='utf-8')"
+
+      - name: Create OAuth credential files (for source copy when not shared with SA)
+        if: steps.gate.outputs.run == 'yes'
+        env:
+          GSPREAD_CREDENTIALS_JSON: ${{ secrets.GSPREAD_CREDENTIALS_JSON }}
+          GSPREAD_AUTHORIZED_USER_JSON: ${{ secrets.GSPREAD_AUTHORIZED_USER_JSON }}
+        run: |
+          if [ -n "$GSPREAD_CREDENTIALS_JSON" ] && [ -n "$GSPREAD_AUTHORIZED_USER_JSON" ]; then
+            python -c "import os, pathlib; pathlib.Path('gspread_credentials.json').write_text(os.environ['GSPREAD_CREDENTIALS_JSON'], encoding='utf-8')"
+            python -c "import os, pathlib; pathlib.Path('gspread_authorized_user.json').write_text(os.environ['GSPREAD_AUTHORIZED_USER_JSON'], encoding='utf-8')"
+            echo "OAuth files created (fallback if service account cannot open source)"
+          elif [ -n "$GSPREAD_CREDENTIALS_JSON" ] || [ -n "$GSPREAD_AUTHORIZED_USER_JSON" ]; then
+            echo "::error::Set BOTH secrets on this repo: GSPREAD_CREDENTIALS_JSON and GSPREAD_AUTHORIZED_USER_JSON (or neither, if the source sheet is shared with the service account)."
+            exit 1
+          else
+            echo "::warning::GSPREAD_* secrets not set. If the Flipkart SOURCE sheet is not shared with the service account, add both secrets OR share the sheet (see job log for client_email)."
+          fi
 
       - name: Run Flipkart Debit Master sync
         if: steps.gate.outputs.run == 'yes'
         env:
           FLIPKART_ODH_SPREADSHEET_ID: ${{ secrets.FLIPKART_ODH_SPREADSHEET_ID }}
-          # Optional WhatsApp (remove --no-whatsapp below if you configure these)
           WHAPI_TOKEN: ${{ secrets.WHAPI_TOKEN }}
           WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
           HTML_TO_IMAGE_SERVICE_URL: ${{ secrets.HTML_TO_IMAGE_SERVICE_URL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GMAIL_SENDER_EMAIL: ${{ secrets.GMAIL_SENDER_EMAIL }}
-        run: |
-          python flipkart_debit_master_sync.py --no-email --no-whatsapp
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        # Full run (email + WhatsApp when secrets exist). If your log shows --no-email --no-whatsapp, push this workflow file to GitHub.
+        run: python flipkart_debit_master_sync.py
+
+      - name: Upload logs on failure
+        if: failure() && steps.gate.outputs.run == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: flipkart-debit-master-logs
+          path: |
+            *.log
+            *_log.txt
+          if-no-files-found: ignore
+          retention-days: 7

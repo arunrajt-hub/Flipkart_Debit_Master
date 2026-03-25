@@ -48,8 +48,9 @@ _DEFAULT_DEST_ID = "1FUH-Z98GFcCTIKpSAeZPGsjIESMVgBB2vrb6QOZO8mM"
 DEST_SHEET_ID = os.getenv("FLIPKART_ODH_SPREADSHEET_ID") or _DEFAULT_DEST_ID
 DEST_WORKSHEET_NAME = "ODH Debit Master"
 
-# WhatsApp image captures (3 blocks; sheet tables written at rows 1, 33, 64)
-DEBIT_MASTER_WA_RANGES = ("A1:Q29", "A33:Q60", "A64:Q91")
+# WhatsApp: 3 row bands (tables at rows 1, 33, 64); end column is detected per band so new month columns are included
+DEBIT_MASTER_WA_ROW_BANDS = ((1, 29), (33, 60), (64, 91))
+DEBIT_MASTER_WA_MAX_COL_SCAN = 52
 DEBIT_MASTER_TABLE2_START_ROW = 33
 DEBIT_MASTER_TABLE3_START_ROW = 64
 
@@ -800,9 +801,9 @@ def _send_recovery_pending_email(df_recovery_pending_raw: pd.DataFrame, date_str
 
 
 def _send_debit_master_to_whatsapp(gc, dest_id: str, worksheet_name: str = DEST_WORKSHEET_NAME) -> None:
-    """Send three Debit Master table screenshots (Active hubs only in sheet): A1:Q29, A33:Q60, A64:Q91."""
+    """Send three Debit Master screenshots; column extent is auto-detected (new month columns included)."""
     try:
-        from whatsapp_sheet_image import send_sheet_range_to_whatsapp
+        from whatsapp_sheet_image import send_sheet_range_to_whatsapp, _get_last_col_with_data
     except ImportError:
         print("  [WARN] WhatsApp skip: install whatsapp_sheet_image deps")
         return
@@ -816,7 +817,11 @@ def _send_debit_master_to_whatsapp(gc, dest_id: str, worksheet_name: str = DEST_
             "Flipkart ODH — Recovery Pending (Active hubs)",
             "Flipkart ODH — Recovered (Active hubs)",
         )
-        for rng, cap in zip(DEBIT_MASTER_WA_RANGES, caps):
+        for (r0, r1), cap in zip(DEBIT_MASTER_WA_ROW_BANDS, caps):
+            end_col = _get_last_col_with_data(
+                ws, start_row=r0, end_row=r1, max_cols=DEBIT_MASTER_WA_MAX_COL_SCAN
+            )
+            rng = f"A{r0}:{end_col}{r1}"
             print(f"    {rng} — {cap}")
             send_sheet_range_to_whatsapp(ws, range=rng, caption=cap)
         print("  WhatsApp done.")
@@ -934,6 +939,8 @@ def main():
         result = copy_sheet_with_user_oauth(
             source_id=args.source_id,
             copy_title=COPY_SHEET_TITLE,
+            credentials_file=SCRIPT_DIR / "gspread_credentials.json",
+            authorized_user_file=SCRIPT_DIR / "gspread_authorized_user.json",
         )
         if not result:
             return

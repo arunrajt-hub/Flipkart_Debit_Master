@@ -218,7 +218,13 @@ def copy_sheet_with_user_oauth(
     if not creds_file.exists():
         print(f"  [ERROR] OAuth credentials not found: {creds_file}")
         print()
-        print("  To automate copy with YOUR account (same as manual File → Make a copy):")
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("  GitHub Actions: create BOTH repository secrets on THIS repo (Settings → Secrets):")
+            print("    • GSPREAD_CREDENTIALS_JSON  — full JSON (Desktop OAuth client), same as local gspread_credentials.json")
+            print("    • GSPREAD_AUTHORIZED_USER_JSON — full JSON after sign-in, same as gspread_authorized_user.json")
+            print("  Or share the SOURCE spreadsheet with the service account (client_email in service_account_key.json).")
+            print()
+        print("  Local / manual copy with YOUR account (same as File → Make a copy):")
         print("  1. Go to: https://console.cloud.google.com/apis/credentials")
         print("  2. Create OAuth client ID (Desktop app)")
         print("  3. Download JSON, rename to gspread_credentials.json")
