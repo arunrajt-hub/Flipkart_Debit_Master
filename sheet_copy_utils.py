@@ -101,7 +101,17 @@ def copy_sheet_for_analysis(
         print(f"  [ERROR] {sa_file} not found")
         return None
 
-    creds = Credentials.from_service_account_file(str(sa_file), scopes=SCOPES)
+    try:
+        creds = Credentials.from_service_account_file(str(sa_file), scopes=SCOPES)
+    except Exception as e:
+        if type(e).__name__ == "MalformedError" or "not in the expected format" in str(e):
+            print(f"  [ERROR] {sa_file} is not a valid Google *service account key* JSON.")
+            print('  Expected: IAM → Service accounts → Keys → Add key → JSON (contains "type": "service_account", "client_email", "private_key").')
+            print("  Not: OAuth Desktop client JSON (that belongs in gspread_credentials.json only).")
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                print("  Fix: replace GitHub secret SERVICE_ACCOUNT_JSON / GOOGLE_SERVICE_ACCOUNT_JSON with the full service-account key file contents.")
+            return None
+        raise
     gc = gspread.authorize(creds)
 
     try:
