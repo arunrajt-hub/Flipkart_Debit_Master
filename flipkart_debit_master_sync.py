@@ -3,7 +3,7 @@ Flipkart (Client) Debit Master Sync
 1. Creates a copy of source sheet: fixed title for replace-on-rerun
 2. Analyzes the copied sheet
 3. Pushes summary to destination (ODH Debit Master worksheet)
-4. Sends to WhatsApp: Total Debit (A1:{cols}25), Recovery Pending (A29:{cols}52)
+4. Sends to WhatsApp: Total Debit, Recovery Pending, Recovered (all hub statuses on sheet)
 
 Source: https://docs.google.com/spreadsheets/d/1sUK3d2abb6EbGBU5O8rIKSp38fPlZMjkL9YM2vl4azA/edit
 Destination: https://docs.google.com/spreadsheets/d/1FUH-Z98GFcCTIKpSAeZPGsjIESMVgBB2vrb6QOZO8mM/edit (worksheet: ODH Debit Master)
@@ -48,11 +48,10 @@ _DEFAULT_DEST_ID = "1FUH-Z98GFcCTIKpSAeZPGsjIESMVgBB2vrb6QOZO8mM"
 DEST_SHEET_ID = os.getenv("FLIPKART_ODH_SPREADSHEET_ID") or _DEFAULT_DEST_ID
 DEST_WORKSHEET_NAME = "ODH Debit Master"
 
-# WhatsApp: 3 row bands (tables at rows 1, 33, 64); end column is detected per band so new month columns are included
+# WhatsApp: fallback row bands if layout is not the standard 3 pivot tables; primary bands come from push_to_destination
 DEBIT_MASTER_WA_ROW_BANDS = ((1, 29), (33, 60), (64, 91))
 DEBIT_MASTER_WA_MAX_COL_SCAN = 52
-DEBIT_MASTER_TABLE2_START_ROW = 33
-DEBIT_MASTER_TABLE3_START_ROW = 64
+TABLE_VERTICAL_GAP = 3  # blank rows between stacked pivot tables on ODH Debit Master
 
 # Fixed copy title - replaces existing copy instead of creating new each run
 COPY_SHEET_TITLE = "Copy of Flipkart Debit Master - Analysis"
@@ -103,8 +102,15 @@ def read_sheet_via_drive_export(copy_id: str, creds) -> pd.DataFrame | None:
         return None
 
 
-# Active hubs only - closed hubs are excluded from Pending Recovery output
+# Meesho-style codes treated as Active when not in FK-ODH attachment map
 _ACTIVE_HUBS = frozenset({"MQR", "MQE", "MHK", "YLZ", "YLG"})
+# ODH Debit Master pivots: include these Status values (Closed/Inactive hubs appear on the output sheet)
+_DEBIT_MASTER_STATUS_INCLUDE = frozenset({"Active", "Closed", "Inactive"})
+# Sort: Active rows first, then Closed, then Inactive; descending by Total within each group
+_HUB_STATUS_SORT_ORDER = {"Active": 0, "Closed": 1, "Inactive": 2}
+# Pivot Total column = sum of month columns from Apr-25 through Mar-26 only (2024-25 and other months excluded)
+_TOTAL_PIVOT_SUM_FIRST_MONTH = pd.Timestamp("2025-04-01")
+_TOTAL_PIVOT_SUM_LAST_MONTH = pd.Timestamp("2026-03-01")
 
 # Recovery Pending sheet: include waybills with Addition Date on or after Apr 1 2025 (no upper limit)
 _PENDING_RECOVERY_MIN_DATE = pd.Timestamp("2025-04-01")
@@ -118,6 +124,10 @@ _HUB_CODE_OVERRIDES = {
     "JPN": "JPW",
     "KOR": "LSK",
 }
+# Same physical hub, alternative spelling / legacy name in source → canonical pivot label
+_HUB_FULL_NAME_MERGE = {
+    "SAIDABADSPILTODH": "SAIDABADSPLITODH_HYD",
+}
 
 
 def _normalize_hub_code(name) -> str:
@@ -129,8 +139,31 @@ def _normalize_hub_code(name) -> str:
     parts = s.replace("-", "/").split("/")
     last = parts[-1].strip().upper() if parts else ""
     code = last if last else s.upper()
+    code = _HUB_FULL_NAME_MERGE.get(code, code)
     # Apply overrides (e.g. MAR, MARATHALLI -> MQR)
     return _HUB_CODE_OVERRIDES.get(code, code)
+
+
+def _debit_master_total_sum_columns(date_cols: list) -> list[str]:
+    """Period column labels included in the Total column: Apr-25 … Mar-26 only."""
+    out: list[str] = []
+    for c in date_cols:
+        label = str(c).strip()
+        if label == "2024-25":
+            continue
+        ts = None
+        for fmt in ("%b-%y", "%d-%b-%y"):
+            try:
+                ts = pd.to_datetime(label, format=fmt)
+                break
+            except (ValueError, TypeError):
+                continue
+        if ts is None or pd.isna(ts):
+            continue
+        month_start = pd.Timestamp(ts.year, ts.month, 1)
+        if _TOTAL_PIVOT_SUM_FIRST_MONTH <= month_start <= _TOTAL_PIVOT_SUM_LAST_MONTH:
+            out.append(c)
+    return out
 
 
 def _omit_hub_pivot_row(val) -> bool:
@@ -275,13 +308,18 @@ def _build_hub_pivot(
             region_list.append(str(region_map.get(h, "") or "").strip())
     pivot["Status"] = status_list
     pivot["Region"] = region_list
-    pivot = pivot[pivot["Status"] == "Active"].copy()
+    pivot = pivot[pivot["Status"].isin(_DEBIT_MASTER_STATUS_INCLUDE)].copy()
     if pivot.empty:
         return pd.DataFrame(columns=[row_label, "Status", "Region"] + date_cols + ["Total"])
-    pivot["Total"] = pivot[date_cols].sum(axis=1)
-    pivot = pivot.sort_values(by="Total", ascending=False)
+    total_sum_cols = _debit_master_total_sum_columns(date_cols)
+    if total_sum_cols:
+        pivot["Total"] = pivot[total_sum_cols].sum(axis=1)
+    else:
+        pivot["Total"] = 0
+    pivot["_st_ord"] = pivot["Status"].map(lambda s: _HUB_STATUS_SORT_ORDER.get(str(s).strip(), 9))
+    pivot = pivot.sort_values(by=["_st_ord", "Total"], ascending=[True, False]).drop(columns=["_st_ord"])
     pivot = pivot[[row_label, "Status", "Region"] + date_cols + ["Total"]]
-    grand = float(pivot[date_cols].to_numpy().sum())
+    grand = float(pivot[total_sum_cols].to_numpy().sum()) if total_sum_cols else 0.0
     total_row = {
         row_label: "Total",
         "Status": "",
@@ -314,7 +352,7 @@ def analyze_recovered_data(df: pd.DataFrame) -> pd.DataFrame:
     hub_col = "Recovered"
     data_rows = pivot[~pivot[hub_col].astype(str).str.strip().isin(["Total", "Active Hubs", "Closed Hubs"])]
     data_rows = data_rows[data_rows["Total"] != 0]
-    data_rows = data_rows[data_rows["Status"] == "Active"]
+    data_rows = data_rows[data_rows["Status"].isin(_DEBIT_MASTER_STATUS_INCLUDE)]
     if data_rows.empty:
         return pd.DataFrame(columns=list(pivot.columns))
     date_cols = [c for c in pivot.columns if c not in (hub_col, "Status", "Region", "Total")]
@@ -324,13 +362,14 @@ def analyze_recovered_data(df: pd.DataFrame) -> pd.DataFrame:
     if not date_cols:
         return pd.DataFrame(columns=list(pivot.columns))
     dr = data_rows[[hub_col, "Status", "Region"] + date_cols + ["Total"]].copy()
-    dr = dr.sort_values(by="Total", ascending=False)
+    dr["_st_ord"] = dr["Status"].map(lambda s: _HUB_STATUS_SORT_ORDER.get(str(s).strip(), 9))
+    dr = dr.sort_values(by=["_st_ord", "Total"], ascending=[True, False]).drop(columns=["_st_ord"])
     total_row = {
         hub_col: "Total",
         "Status": "",
         "Region": "",
         **{c: dr[c].sum() for c in date_cols},
-        "Total": dr[date_cols].sum().sum(),
+        "Total": float(dr["Total"].sum()),
     }
     return pd.concat([dr, pd.DataFrame([total_row])], ignore_index=True)
 
@@ -433,7 +472,11 @@ def get_recovery_pending_raw(df: pd.DataFrame, include_closed_hubs: bool = False
     out["S. No"] = range(1, len(df) + 1)
     out["Addition Date"] = df[add_col].astype(str).str.strip().values if add_col else ""
     out["Tracking ID"] = df[track_col].astype(str).str.strip().values if track_col else ""
-    out["Hub Name"] = df[hub_col].astype(str).str.strip().values if hub_col else ""
+    out["Hub Name"] = (
+        df[hub_col].astype(str).str.strip().map(lambda x: _HUB_FULL_NAME_MERGE.get(str(x).strip().upper(), str(x).strip())).values
+        if hub_col
+        else ""
+    )
     out["Debit Value ₹"] = (df[debit_col].astype(str).str.replace(r"[,₹\s]", "", regex=True).values if debit_col else [0] * len(df))
     out["Debit Value ₹"] = pd.to_numeric(out["Debit Value ₹"], errors="coerce").fillna(0)
     out["Pending Amount"] = df[pending_col].values
@@ -564,8 +607,13 @@ def _apply_table_format(ws, start_row: int, nrows: int, ncols: int, date_col: st
         ws.format(f"A{recovery_row_1based}:{end_col}{recovery_row_1based}", {"textFormat": {"bold": True}, "backgroundColor": _RECOVERY_PCT_BG})
 
 
-def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pending=None, df_recovery_pending_raw=None, worksheet_name: str = DEST_WORKSHEET_NAME) -> bool:
-    """Push Debit, Pending (2nd), Recovered (3rd) tables to Debit Master. Push raw recovery pending to 'Recovery pending' sheet."""
+def push_to_destination(
+    gc, dest_id: str, df_debit, df_recovered=None, df_pending=None, df_recovery_pending_raw=None, worksheet_name: str = DEST_WORKSHEET_NAME
+) -> tuple[bool, tuple[tuple[int, int], ...]]:
+    """Push Debit, Pending (2nd), Recovered (3rd) tables to Debit Master. Push raw recovery pending to 'Recovery pending' sheet.
+
+    Returns (success, whatsapp_row_bands): bands are (start_row, end_row) inclusive per table, for use when exactly three pivot tables are written.
+    """
     sh = gc.open_by_key(dest_id)
     try:
         ws = sh.worksheet(worksheet_name)
@@ -586,8 +634,12 @@ def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pendin
         if not debit_total_row.empty:
             _skip_val = {date_col_1, "Status", "Region", "Total"}
             value_cols = [c for c in df_debit.columns if c not in _skip_val]
-            d_total = sum(_parse_numeric(debit_total_row[c].iloc[0]) if c in debit_total_row.columns else 0 for c in value_cols)
-            p_total = sum(_parse_numeric(pending_total_row[c].iloc[0]) if not pending_total_row.empty and c in pending_total_row.columns else 0 for c in value_cols)
+            fy_total_cols = _debit_master_total_sum_columns(value_cols)
+            d_total = sum(_parse_numeric(debit_total_row[c].iloc[0]) if c in debit_total_row.columns else 0 for c in fy_total_cols)
+            p_total = sum(
+                _parse_numeric(pending_total_row[c].iloc[0]) if not pending_total_row.empty and c in pending_total_row.columns else 0
+                for c in fy_total_cols
+            )
             overall_pct = ((d_total - p_total) / d_total * 100) if d_total != 0 else 0
             recovery_pct_row = {date_col_1: "Recovery%"}
             for c in df_debit.columns:
@@ -610,8 +662,12 @@ def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pendin
                     recovery_pct_row[c] = f"{int(round(overall_pct))}%"
             df_debit = pd.concat([df_debit, pd.DataFrame([recovery_pct_row])], ignore_index=True)
     df1 = _format_df_for_sheet(df_debit, date_col_1)
-    _push_table(ws, df1, start_row=1, date_col=date_col_1 or "Total Debit")
-    _apply_table_format(ws, 1, len(df1) + 1, len(df1.columns), date_col_1 or "Total Debit", df1)
+    wa_bands: list[tuple[int, int]] = []
+    cur_row = 1
+    _push_table(ws, df1, start_row=cur_row, date_col=date_col_1 or "Total Debit")
+    _apply_table_format(ws, cur_row, len(df1) + 1, len(df1.columns), date_col_1 or "Total Debit", df1)
+    wa_bands.append((cur_row, cur_row + len(df1)))
+    cur_row = cur_row + len(df1) + TABLE_VERTICAL_GAP
 
     if df_pending is not None and not df_pending.empty:
         date_col_p = (
@@ -620,15 +676,17 @@ def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pendin
             else (df_pending.columns[0] if len(df_pending.columns) else "Recovery Pending")
         )
         df_p_fmt = _format_df_for_sheet(df_pending, date_col_p)
-        _push_table(ws, df_p_fmt, start_row=DEBIT_MASTER_TABLE2_START_ROW, date_col=date_col_p)
+        _push_table(ws, df_p_fmt, start_row=cur_row, date_col=date_col_p)
         _apply_table_format(
             ws,
-            DEBIT_MASTER_TABLE2_START_ROW,
+            cur_row,
             len(df_p_fmt) + 1,
             len(df_p_fmt.columns),
             date_col_p,
             df_p_fmt,
         )
+        wa_bands.append((cur_row, cur_row + len(df_p_fmt)))
+        cur_row = cur_row + len(df_p_fmt) + TABLE_VERTICAL_GAP
 
     if df_recovered is not None and not df_recovered.empty:
         fallback_r = "Recovered"
@@ -636,15 +694,17 @@ def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pendin
             "Recovered" if "Recovered" in df_recovered.columns else (df_recovered.columns[0] if len(df_recovered.columns) else fallback_r)
         )
         df_r_fmt = _format_df_for_sheet(df_recovered, date_col_r)
-        _push_table(ws, df_r_fmt, start_row=DEBIT_MASTER_TABLE3_START_ROW, date_col=date_col_r)
+        _push_table(ws, df_r_fmt, start_row=cur_row, date_col=date_col_r)
         _apply_table_format(
             ws,
-            DEBIT_MASTER_TABLE3_START_ROW,
+            cur_row,
             len(df_r_fmt) + 1,
             len(df_r_fmt.columns),
             date_col_r,
             df_r_fmt,
         )
+        wa_bands.append((cur_row, cur_row + len(df_r_fmt)))
+        cur_row = cur_row + len(df_r_fmt) + TABLE_VERTICAL_GAP
     # Always push raw recovery pending sheet (create/update even when empty)
     df_rp = df_recovery_pending_raw if df_recovery_pending_raw is not None and not df_recovery_pending_raw.empty else None
     if df_rp is None or df_rp.empty:
@@ -681,7 +741,7 @@ def push_to_destination(gc, dest_id: str, df_debit, df_recovered=None, df_pendin
     n = 0 if df_recovery_pending_raw is None or df_recovery_pending_raw.empty else len(df_recovery_pending_raw)
     print(f"  Pushed raw to: {sh.title} / {ws_rp.title} ({n} rows)")
     print(f"  Pushed to: {sh.title} / {ws.title}")
-    return True
+    return True, tuple(wa_bands)
 
 
 # Recovery Pending email config
@@ -800,7 +860,9 @@ def _send_recovery_pending_email(df_recovery_pending_raw: pd.DataFrame, date_str
         print(f"  [WARN] Recovery Pending email failed: {e}")
 
 
-def _send_debit_master_to_whatsapp(gc, dest_id: str, worksheet_name: str = DEST_WORKSHEET_NAME) -> None:
+def _send_debit_master_to_whatsapp(
+    gc, dest_id: str, worksheet_name: str = DEST_WORKSHEET_NAME, row_bands: tuple[tuple[int, int], ...] | None = None
+) -> None:
     """Send three Debit Master screenshots; column extent is auto-detected (new month columns included)."""
     try:
         from whatsapp_sheet_image import send_sheet_range_to_whatsapp, _get_last_col_with_data
@@ -811,13 +873,14 @@ def _send_debit_master_to_whatsapp(gc, dest_id: str, worksheet_name: str = DEST_
         sh = gc.open_by_key(dest_id)
         ws = sh.worksheet(worksheet_name)
         print("-" * 40)
-        print("  Sending Debit Master to WhatsApp (3 tables, Active hubs)...")
+        print("  Sending Debit Master to WhatsApp (3 tables, all hub statuses)...")
         caps = (
-            "Flipkart ODH — Total Debit (Active hubs)",
-            "Flipkart ODH — Recovery Pending (Active hubs)",
-            "Flipkart ODH — Recovered (Active hubs)",
+            "Flipkart ODH — Total Debit (all hubs)",
+            "Flipkart ODH — Recovery Pending (all hubs)",
+            "Flipkart ODH — Recovered (all hubs)",
         )
-        for (r0, r1), cap in zip(DEBIT_MASTER_WA_ROW_BANDS, caps):
+        bands = row_bands if row_bands is not None and len(row_bands) == 3 else DEBIT_MASTER_WA_ROW_BANDS
+        for (r0, r1), cap in zip(bands, caps):
             end_col = _get_last_col_with_data(
                 ws, start_row=r0, end_row=r1, max_cols=DEBIT_MASTER_WA_MAX_COL_SCAN
             )
@@ -892,15 +955,15 @@ def main():
             df_recovered = analyze_recovered_data(df)
             df_pending = analyze_pending_data(df)
             df_recovery_pending_raw = get_recovery_pending_raw(df, include_closed_hubs=args.pending_include_closed_hubs, apply_date_cutoff=not args.pending_include_all_dates)
-            ok = push_to_destination(gc, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
+            ok, wa_bands = push_to_destination(gc, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
             if ok and not args.no_email and df_recovery_pending_raw is not None and not df_recovery_pending_raw.empty:
                 _send_recovery_pending_email(df_recovery_pending_raw)
             if ok and not args.no_whatsapp:
-                _send_debit_master_to_whatsapp(gc, dest_id, args.dest_worksheet)
+                _send_debit_master_to_whatsapp(gc, dest_id, args.dest_worksheet, row_bands=wa_bands if len(wa_bands) == 3 else None)
         else:
-            ok = push_to_destination(gc, dest_id, df, None, None, None, args.dest_worksheet)
+            ok, wa_bands = push_to_destination(gc, dest_id, df, None, None, None, args.dest_worksheet)
             if ok and not args.no_whatsapp:
-                _send_debit_master_to_whatsapp(gc, dest_id, args.dest_worksheet)
+                _send_debit_master_to_whatsapp(gc, dest_id, args.dest_worksheet, row_bands=wa_bands if len(wa_bands) == 3 else None)
         print("Done.")
         return
 
@@ -964,15 +1027,15 @@ def main():
             df_recovered = analyze_recovered_data(df)
             df_pending = analyze_pending_data(df)
             df_recovery_pending_raw = get_recovery_pending_raw(df, include_closed_hubs=args.pending_include_closed_hubs, apply_date_cutoff=not args.pending_include_all_dates)
-            ok = push_to_destination(gc_dest, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
+            ok, wa_bands = push_to_destination(gc_dest, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
             if ok and not args.no_email and df_recovery_pending_raw is not None and not df_recovery_pending_raw.empty:
                 _send_recovery_pending_email(df_recovery_pending_raw)
             if ok and not args.no_whatsapp:
-                _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet)
+                _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet, row_bands=wa_bands if len(wa_bands) == 3 else None)
         else:
-            ok = push_to_destination(gc_dest, dest_id, df, None, None, None, args.dest_worksheet)
+            ok, wa_bands = push_to_destination(gc_dest, dest_id, df, None, None, None, args.dest_worksheet)
             if ok and not args.no_whatsapp:
-                _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet)
+                _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet, row_bands=wa_bands if len(wa_bands) == 3 else None)
         print("Done.")
         return
 
@@ -999,11 +1062,11 @@ def main():
         return
     sa_creds = Credentials.from_service_account_file(str(SERVICE_ACCOUNT_FILE), scopes=SCOPES)
     gc_dest = gspread.authorize(sa_creds)
-    ok = push_to_destination(gc_dest, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
+    ok, wa_bands = push_to_destination(gc_dest, dest_id, df_debit, df_recovered, df_pending, df_recovery_pending_raw, args.dest_worksheet)
     if ok and not args.no_email and df_recovery_pending_raw is not None and not df_recovery_pending_raw.empty:
         _send_recovery_pending_email(df_recovery_pending_raw)
     if ok and not args.no_whatsapp:
-        _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet)
+        _send_debit_master_to_whatsapp(gc_dest, dest_id, args.dest_worksheet, row_bands=wa_bands if len(wa_bands) == 3 else None)
     print("Done.")
 
 
